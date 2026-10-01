@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -108,21 +107,11 @@ func (s *store) setTokens(acc *account, tok *tokenResponse) error {
 	return s.save()
 }
 
-// save writes through a temp file so a crash mid-write never truncates the token store. Caller holds mu.
+// save persists the accounts. Caller holds mu.
 func (s *store) save() error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return fmt.Errorf("create config dir: %w", err)
-	}
 	data, err := json.MarshalIndent(accountsFile{Accounts: s.accounts}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode accounts: %w", err)
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", tmp, err)
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		return fmt.Errorf("replace %s: %w", s.path, err)
-	}
-	return nil
+	return writeFileAtomic(s.path, data)
 }

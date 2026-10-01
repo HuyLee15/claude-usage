@@ -72,23 +72,31 @@ same data as JSON at `/api/usage`.
    (default `~/.config/claude-usage` on Linux).
 3. On every check the tool refreshes any token that is about to expire (or that the API rejects with
    401) using the refresh token, persists the rotated pair immediately, then calls
-   `GET https://api.anthropic.com/api/oauth/usage` with `Authorization: Bearer …` and
-   `anthropic-beta: oauth-2025-04-20`. Accounts are queried in parallel.
-4. If a refresh token is revoked (logged out of all devices, grant expired), the row shows
+   `GET https://api.anthropic.com/api/oauth/usage` with `Authorization: Bearer …`,
+   `anthropic-beta: oauth-2025-04-20` and a Claude Code `User-Agent`. Accounts are queried in parallel.
+4. Results are cached in `cache.json` for `CLAUDE_USAGE_CACHE_TTL` (60 s). A failed fetch keeps showing the last
+   good numbers marked "as of … ago" and backs off 1, 2, 4, 8, then 15 minutes before that account is tried
+   again. `--force` skips the cache window but never the backoff.
+5. Every process takes a lock on the config dir for the whole cycle. Refresh tokens rotate on use, so this keeps
+   two callers from refreshing the same account at once and leaving one with a revoked token.
+6. If a refresh token is revoked (logged out of all devices, grant expired), the row shows
    `login required` and `claude-usage login <name>` fixes it.
 
 ## Environment
 
-| Variable                  | Default                       | Purpose                                  |
-|---------------------------|-------------------------------|------------------------------------------|
-| `CLAUDE_USAGE_CONFIG_DIR` | `<user config dir>/claude-usage` | where `accounts.json` lives            |
-| `CLAUDE_USAGE_API_BASE`   | `https://api.anthropic.com`   | host of the usage endpoint               |
-| `CLAUDE_USAGE_OAUTH_BASE` | `https://platform.claude.com` | host of the token endpoint               |
-| `NO_COLOR`                | unset                         | disable ANSI colors in the table         |
+| Variable                  | Default                          | Purpose                                  |
+|---------------------------|----------------------------------|------------------------------------------|
+| `CLAUDE_USAGE_CONFIG_DIR` | `<user config dir>/claude-usage` | where `accounts.json` and `cache.json` live |
+| `CLAUDE_USAGE_CACHE_TTL`  | `60s`                            | how long a fetched result is reused      |
+| `CLAUDE_USAGE_USER_AGENT` | `claude-code/2.1.285`            | User-Agent sent to Anthropic             |
+| `CLAUDE_USAGE_API_BASE`   | `https://api.anthropic.com`      | host of the usage endpoint               |
+| `CLAUDE_USAGE_OAUTH_BASE` | `https://platform.claude.com`    | host of the token endpoint               |
+| `NO_COLOR`                | unset                            | disable ANSI colors in the table         |
 
 ## Limitations
 
 - `/api/oauth/usage` is not a documented API; Anthropic may change its shape without notice.
 - Organizations that disable OAuth for Claude Code return HTTP 403 for that account.
-- Poll no faster than once a minute per account: the endpoint rate-limits, and the tool shows
-  `rate limited (retry in …)` when it does.
+- The endpoint rate-limits by `User-Agent`: any value other than Claude Code's gets HTTP 429 almost every time
+  ([anthropics/claude-code#30930](https://github.com/anthropics/claude-code/issues/30930)). Even with the right
+  value it throttles if polled too often, which is what the cache and backoff are for.

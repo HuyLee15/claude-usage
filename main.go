@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -21,7 +20,8 @@ var version = "dev"
 const usageText = `claude-usage — rate-limit usage of every Claude subscription account in one place
 
 Usage:
-  claude-usage [check] [--json]          show 5h / weekly usage for all accounts
+  claude-usage [check] [--json] [--force]
+                                         show 5h / weekly usage for all accounts
   claude-usage login [--no-browser] <name>
                                          add (or re-authorize) an account via browser login
   claude-usage list                      list stored accounts
@@ -30,8 +30,12 @@ Usage:
                                          local web dashboard
   claude-usage version
 
+Results are cached for CLAUDE_USAGE_CACHE_TTL; --force skips that window but never a rate-limit backoff.
+
 Environment:
-  CLAUDE_USAGE_CONFIG_DIR   where accounts.json lives (default: <user config dir>/claude-usage)
+  CLAUDE_USAGE_CONFIG_DIR   where accounts.json and cache.json live (default: <user config dir>/claude-usage)
+  CLAUDE_USAGE_CACHE_TTL    how long a fetched result is reused (default 60s)
+  CLAUDE_USAGE_USER_AGENT   User-Agent sent to Anthropic (default claude-code/<version>)
   CLAUDE_USAGE_API_BASE     usage endpoint host (default https://api.anthropic.com)
   CLAUDE_USAGE_OAUTH_BASE   token endpoint host (default https://platform.claude.com)
   NO_COLOR                  disable ANSI colors
@@ -52,10 +56,6 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	st, err := openStore(filepath.Join(cfg.configDir, accountsFileName))
-	if err != nil {
-		return err
-	}
 	cli := newClient(cfg)
 
 	cmd := "check"
@@ -64,15 +64,15 @@ func run(args []string) error {
 	}
 	switch cmd {
 	case "check":
-		return runCheck(ctx, cli, st, args)
+		return runCheck(ctx, cli, args)
 	case "login":
-		return runLogin(ctx, cli, st, args)
+		return runLogin(ctx, cli, args)
 	case "list":
-		return runList(st)
+		return runList(cli)
 	case "remove":
-		return runRemove(st, args)
+		return runRemove(cli, args)
 	case "serve":
-		return runServe(ctx, cli, st, args)
+		return runServe(ctx, cli, args)
 	case "version":
 		fmt.Println("claude-usage", version)
 		return nil
@@ -82,23 +82,23 @@ func run(args []string) error {
 	}
 	if strings.HasPrefix(cmd, "-") {
 		// Bare flags (`claude-usage --json`) belong to the default command.
-		return runCheck(ctx, cli, st, append([]string{cmd}, args...))
+		return runCheck(ctx, cli, append([]string{cmd}, args...))
 	}
 	fmt.Fprint(os.Stderr, usageText)
 	return fmt.Errorf("unknown command %q", cmd)
 }
 
-func runCheck(ctx context.Context, cli *client, st *store, args []string) error {
+func runCheck(ctx context.Context, cli *client, args []string) error {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "print machine-readable JSON instead of a table")
+	force := fs.Bool("force", false, "ignore the cache freshness window (rate-limit backoff still applies)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	accounts := st.list()
-	if len(accounts) == 0 {
-		return errors.New("no accounts yet: run `claude-usage login <name>` first")
+	results, err := cli.snapshot(ctx, *force)
+	if err != nil {
+		return err
 	}
-	results := cli.fetchAll(ctx, st, accounts)
 	if *asJSON {
 		return writeJSON(os.Stdout, results)
 	}
@@ -106,7 +106,7 @@ func runCheck(ctx context.Context, cli *client, st *store, args []string) error 
 	return nil
 }
 
-func runLogin(ctx context.Context, cli *client, st *store, args []string) error {
+func runLogin(ctx context.Context, cli *client, args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	noBrowser := fs.Bool("no-browser", false, "print the URL only; do not try to open a browser")
 	if err := fs.Parse(args); err != nil {
@@ -116,23 +116,31 @@ func runLogin(ctx context.Context, cli *client, st *store, args []string) error 
 		return errors.New("usage: claude-usage login [--no-browser] <name>")
 	}
 	name := fs.Arg(0)
+	// The browser step can take minutes, so it runs before taking the lock that pollers wait on.
 	tok, err := cli.login(ctx, os.Stdin, os.Stdout, !*noBrowser)
 	if err != nil {
 		return fmt.Errorf("login %s: %w", name, err)
 	}
 	acc := &account{Name: name, AddedAt: time.Now()}
 	acc.applyTokens(tok)
-	if err := st.upsert(acc); err != nil {
+	if err := cli.mutateAccounts(func(st *store, cache *usageCache) error {
+		cache.forget(name)
+		return st.upsert(acc)
+	}); err != nil {
 		return err
 	}
 	fmt.Printf("Logged in %q as %s (%s); token valid for %s\n", name, acc.Email, acc.Organization, formatUntil(acc.ExpiresAt))
 	return nil
 }
 
-func runList(st *store) error {
+func runList(cli *client) error {
+	st, err := openStore(cli.accountsPath())
+	if err != nil {
+		return err
+	}
 	accounts := st.list()
 	if len(accounts) == 0 {
-		fmt.Println("no accounts yet: run `claude-usage login <name>` first")
+		fmt.Println(errNoAccounts)
 		return nil
 	}
 	for _, acc := range accounts {
@@ -145,18 +153,22 @@ func runList(st *store) error {
 	return nil
 }
 
-func runRemove(st *store, args []string) error {
+func runRemove(cli *client, args []string) error {
 	if len(args) != 1 || args[0] == "" {
 		return errors.New("usage: claude-usage remove <name>")
 	}
-	if err := st.remove(args[0]); err != nil {
-		return fmt.Errorf("remove %s: %w", args[0], err)
+	name := args[0]
+	if err := cli.mutateAccounts(func(st *store, cache *usageCache) error {
+		cache.forget(name)
+		return st.remove(name)
+	}); err != nil {
+		return fmt.Errorf("remove %s: %w", name, err)
 	}
-	fmt.Printf("Removed %q\n", args[0])
+	fmt.Printf("Removed %q\n", name)
 	return nil
 }
 
-func runServe(ctx context.Context, cli *client, st *store, args []string) error {
+func runServe(ctx context.Context, cli *client, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:8787", "listen address")
 	interval := fs.Duration("interval", time.Minute, "how often to poll the usage endpoint")
@@ -166,8 +178,5 @@ func runServe(ctx context.Context, cli *client, st *store, args []string) error 
 	if *interval < 10*time.Second {
 		return errors.New("interval must be at least 10s")
 	}
-	if len(st.list()) == 0 {
-		return errors.New("no accounts yet: run `claude-usage login <name>` first")
-	}
-	return serve(ctx, cli, st, *addr, *interval)
+	return serve(ctx, cli, *addr, *interval)
 }

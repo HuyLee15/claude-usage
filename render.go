@@ -53,14 +53,18 @@ func renderTable(w io.Writer, results []result, color bool) {
 		nameWidth, "ACCOUNT", emailWidth, "EMAIL", barWidth+5, "5H", "RESETS", barWidth+5, "WEEK", "RESETS", "SONNET", "OPUS")
 	for _, r := range results {
 		fmt.Fprintf(w, "%-*s  %-*s  ", nameWidth, r.Account.Name, emailWidth, r.Account.Email)
-		if r.Err != nil {
+		if r.Usage == nil {
 			fmt.Fprintln(w, paint(colorRed, r.Err.Error(), color))
 			continue
 		}
-		fmt.Fprintf(w, "%s  %-8s  %s  %-8s  %-6s  %-6s\n",
+		fmt.Fprintf(w, "%s  %-8s  %s  %-8s  %-6s  %-6s",
 			bar(r.Usage.FiveHour, color), resets(r.Usage.FiveHour),
 			bar(r.Usage.SevenDay, color), resets(r.Usage.SevenDay),
 			pct(r.Usage.SevenDaySonnet), pct(r.Usage.SevenDayOpus))
+		if r.Err != nil {
+			fmt.Fprint(w, "  ", paint(colorDim, "as of "+formatAgo(r.FetchedAt)+" ago: "+r.Err.Error(), color))
+		}
+		fmt.Fprintln(w)
 	}
 	fmt.Fprintln(w, paint(colorDim, "updated "+time.Now().Format("15:04:05"), color))
 }
@@ -97,10 +101,17 @@ func paint(code, text string, enabled bool) string {
 }
 
 func formatUntil(t time.Time) string {
-	d := time.Until(t)
-	if d <= 0 {
-		return "now"
+	if d := time.Until(t); d > 0 {
+		return formatDuration(d)
 	}
+	return "now"
+}
+
+func formatAgo(t time.Time) string {
+	return formatDuration(time.Since(t))
+}
+
+func formatDuration(d time.Duration) string {
 	days := int(d.Hours()) / 24
 	hours := int(d.Hours()) % 24
 	minutes := int(d.Minutes()) % 60
@@ -112,23 +123,29 @@ func formatUntil(t time.Time) string {
 	case minutes > 0:
 		return fmt.Sprintf("%dm", minutes)
 	}
-	return "<1m"
+	return fmt.Sprintf("%ds", int(d.Seconds()))
 }
 
 type resultJSON struct {
-	Name      string    `json:"name"`
-	Email     string    `json:"email,omitempty"`
-	Usage     *usage    `json:"usage,omitempty"`
-	Error     string    `json:"error,omitempty"`
-	FetchedAt time.Time `json:"fetched_at"`
+	Name  string `json:"name"`
+	Email string `json:"email,omitempty"`
+	Usage *usage `json:"usage,omitempty"`
+	// Stale marks usage served from the last good fetch because the latest attempt failed.
+	Stale     bool       `json:"stale,omitempty"`
+	Error     string     `json:"error,omitempty"`
+	FetchedAt *time.Time `json:"fetched_at,omitempty"`
 }
 
 func toJSON(results []result) []resultJSON {
 	out := make([]resultJSON, 0, len(results))
 	for _, r := range results {
-		item := resultJSON{Name: r.Account.Name, Email: r.Account.Email, Usage: r.Usage, FetchedAt: r.FetchedAt}
+		item := resultJSON{Name: r.Account.Name, Email: r.Account.Email, Usage: r.Usage}
+		if r.Usage != nil {
+			item.FetchedAt = &r.FetchedAt
+		}
 		if r.Err != nil {
 			item.Error = r.Err.Error()
+			item.Stale = r.Usage != nil
 		}
 		out = append(out, item)
 	}

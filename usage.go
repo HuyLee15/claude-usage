@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,7 +25,10 @@ const (
 	defaultRetryAfter = time.Minute
 )
 
-var errLoginRequired = errors.New("login required")
+var (
+	errLoginRequired = errors.New("login required")
+	errNoAccounts    = errors.New("no accounts yet: run `claude-usage login <name>` first")
+)
 
 // window is one rate-limit bucket; resets_at is null for buckets the plan does not track.
 type window struct {
@@ -39,6 +43,8 @@ type usage struct {
 	SevenDayOpus   *window `json:"seven_day_opus"`
 }
 
+// result carries the newest usage known for an account; Usage and Err are both set when a fetch failed
+// and the last good value is shown as stale.
 type result struct {
 	Account   *account
 	Usage     *usage
@@ -46,10 +52,23 @@ type result struct {
 	FetchedAt time.Time
 }
 
+// backoffError tells the caller when the next real request for the account will be attempted.
+type backoffError struct {
+	reason  string
+	retryAt time.Time
+}
+
+func (e *backoffError) Error() string {
+	return fmt.Sprintf("%s; next try in %s", e.reason, formatUntil(e.retryAt))
+}
+
 type client struct {
 	httpClient *http.Client
 	apiBase    string
 	oauthBase  string
+	userAgent  string
+	configDir  string
+	cacheTTL   time.Duration
 }
 
 func newClient(cfg settings) *client {
@@ -57,11 +76,51 @@ func newClient(cfg settings) *client {
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		apiBase:    cfg.apiBase,
 		oauthBase:  cfg.oauthBase,
+		userAgent:  cfg.userAgent,
+		configDir:  cfg.configDir,
+		cacheTTL:   cfg.cacheTTL,
 	}
 }
 
+func (c *client) accountsPath() string {
+	return filepath.Join(c.configDir, accountsFileName)
+}
+
+func (c *client) cachePath() string {
+	return filepath.Join(c.configDir, cacheFileName)
+}
+
+// snapshot runs one fetch cycle under the config-dir lock and re-reads both files inside it,
+// so it always starts from tokens another process may have just rotated.
+func (c *client) snapshot(ctx context.Context, force bool) ([]result, error) {
+	unlock, err := lockConfigDir(c.configDir)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	st, err := openStore(c.accountsPath())
+	if err != nil {
+		return nil, err
+	}
+	accounts := st.list()
+	if len(accounts) == 0 {
+		return nil, errNoAccounts
+	}
+	cache, err := openCache(c.cachePath())
+	if err != nil {
+		return nil, err
+	}
+	cache.retain(accounts)
+	results := c.fetchAll(ctx, st, cache, accounts, force)
+	if err := cache.save(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
 // fetchAll queries every account in parallel and returns results in the same order.
-func (c *client) fetchAll(ctx context.Context, st *store, accounts []*account) []result {
+func (c *client) fetchAll(ctx context.Context, st *store, cache *usageCache, accounts []*account, force bool) []result {
 	var wg sync.WaitGroup
 
 	results := make([]result, len(accounts))
@@ -69,12 +128,38 @@ func (c *client) fetchAll(ctx context.Context, st *store, accounts []*account) [
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			u, err := c.fetchOne(ctx, st, acc)
-			results[i] = result{Account: acc, Usage: u, Err: err, FetchedAt: time.Now()}
+			results[i] = c.fetchCached(ctx, st, cache, acc, force)
 		}()
 	}
 	wg.Wait()
 	return results
+}
+
+// fetchCached serves a fresh cache entry, honours the account's backoff, and only then calls the API.
+// force skips the freshness window but never the backoff.
+func (c *client) fetchCached(ctx context.Context, st *store, cache *usageCache, acc *account, force bool) result {
+	now := time.Now()
+	entry := cache.get(acc.Name)
+	cached := result{Account: acc, Usage: entry.Usage, FetchedAt: entry.FetchedAt}
+	if now.Before(entry.RetryAt) {
+		cached.Err = &backoffError{reason: entry.LastError, retryAt: entry.RetryAt}
+		return cached
+	}
+	if !force && entry.Usage != nil && now.Sub(entry.FetchedAt) < c.cacheTTL {
+		return cached
+	}
+	u, err := c.fetchOne(ctx, st, acc)
+	if err != nil {
+		if ctx.Err() != nil {
+			// An interrupted run says nothing about the endpoint, so it must not start a backoff.
+			cached.Err = err
+			return cached
+		}
+		cached.Err = &backoffError{reason: err.Error(), retryAt: cache.recordFailure(acc.Name, err, now)}
+		return cached
+	}
+	cache.recordSuccess(acc.Name, u, now)
+	return result{Account: acc, Usage: u, FetchedAt: now}
 }
 
 func (c *client) fetchOne(ctx context.Context, st *store, acc *account) (*usage, error) {
@@ -142,7 +227,7 @@ func (c *client) doJSON(ctx context.Context, method, endpoint, bearer string, bo
 		return fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "claude-usage/"+version)
+	req.Header.Set("User-Agent", c.userAgent)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -181,7 +266,7 @@ type httpError struct {
 func (e *httpError) Error() string {
 	switch {
 	case e.Status == http.StatusTooManyRequests:
-		return fmt.Sprintf("rate limited (retry in %s)", e.RetryAfter.Round(time.Second))
+		return "rate limited (HTTP 429)"
 	case e.Body == "":
 		return fmt.Sprintf("HTTP %d", e.Status)
 	}
@@ -212,4 +297,26 @@ func preview(data []byte) string {
 		return string(text[:160]) + "…"
 	}
 	return string(text)
+}
+
+// mutateAccounts applies a change to the stored accounts under the config-dir lock.
+func (c *client) mutateAccounts(change func(st *store, cache *usageCache) error) error {
+	unlock, err := lockConfigDir(c.configDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	st, err := openStore(c.accountsPath())
+	if err != nil {
+		return err
+	}
+	cache, err := openCache(c.cachePath())
+	if err != nil {
+		return err
+	}
+	if err := change(st, cache); err != nil {
+		return err
+	}
+	return cache.save()
 }

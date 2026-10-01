@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -17,29 +18,34 @@ const minManualRefresh = 10 * time.Second
 
 type dashboard struct {
 	cli      *client
-	st       *store
 	interval time.Duration
 
 	mu      sync.RWMutex
 	results []result
 	updated time.Time
+	err     error
 }
 
 type pageData struct {
 	Rows           []result
 	Updated        string
 	RefreshSeconds int
+	Err            error
 }
 
 var pageTemplate = template.Must(template.New("page").Funcs(template.FuncMap{
 	"pct":    pct,
 	"resets": resets,
 	"level":  level,
+	"ago":    formatAgo,
 }).Parse(pageHTML))
 
-func serve(ctx context.Context, cli *client, st *store, addr string, interval time.Duration) error {
-	d := &dashboard{cli: cli, st: st, interval: interval}
-	d.refresh(ctx)
+func serve(ctx context.Context, cli *client, addr string, interval time.Duration) error {
+	d := &dashboard{cli: cli, interval: interval}
+	d.refresh(ctx, false)
+	if errors.Is(d.err, errNoAccounts) {
+		return d.err
+	}
 	go d.poll(ctx)
 
 	mux := http.NewServeMux()
@@ -64,37 +70,44 @@ func (d *dashboard) poll(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			d.refresh(ctx)
+			d.refresh(ctx, false)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (d *dashboard) refresh(ctx context.Context) {
-	results := d.cli.fetchAll(ctx, d.st, d.st.list())
+// refresh keeps the previous rows when a whole cycle fails, so a transient error does not blank the page.
+func (d *dashboard) refresh(ctx context.Context, force bool) {
+	results, err := d.cli.snapshot(ctx, force)
 	d.mu.Lock()
-	d.results, d.updated = results, time.Now()
-	d.mu.Unlock()
+	defer d.mu.Unlock()
+	d.updated, d.err = time.Now(), err
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "refresh:", err)
+		return
+	}
+	d.results = results
 }
 
-func (d *dashboard) snapshot() ([]result, time.Time) {
+func (d *dashboard) snapshot() ([]result, time.Time, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.results, d.updated
+	return d.results, d.updated, d.err
 }
 
 func (d *dashboard) handleIndex(w http.ResponseWriter, r *http.Request) {
 	var buf bytes.Buffer
 
-	results, updated := d.snapshot()
-	err := pageTemplate.Execute(&buf, pageData{
+	results, updated, err := d.snapshot()
+	execErr := pageTemplate.Execute(&buf, pageData{
 		Rows:           results,
 		Updated:        updated.Format("15:04:05"),
 		RefreshSeconds: int(d.interval.Seconds()),
+		Err:            err,
 	})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if execErr != nil {
+		http.Error(w, execErr.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -102,7 +115,7 @@ func (d *dashboard) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *dashboard) handleJSON(w http.ResponseWriter, r *http.Request) {
-	results, _ := d.snapshot()
+	results, _, _ := d.snapshot()
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(toJSON(results)); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -110,9 +123,9 @@ func (d *dashboard) handleJSON(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *dashboard) handleRefresh(w http.ResponseWriter, r *http.Request) {
-	if _, updated := d.snapshot(); time.Since(updated) >= minManualRefresh {
+	if _, updated, _ := d.snapshot(); time.Since(updated) >= minManualRefresh {
 		// A client that disconnects mid-refresh must not leave cancelled results in the snapshot.
-		d.refresh(context.WithoutCancel(r.Context()))
+		d.refresh(context.WithoutCancel(r.Context()), true)
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
@@ -140,16 +153,19 @@ const pageHTML = `<!doctype html>
 </head>
 <body>
 <h1>Claude usage</h1>
+{{if .Err}}<p class="err">last refresh failed: {{.Err}}</p>{{end}}
 <p class="muted">updated {{.Updated}} · auto-refresh every {{.RefreshSeconds}}s · <form method="post" action="/refresh"><button>refresh now</button></form></p>
 <table>
-<tr><th>Account</th><th>Email</th><th>5h</th><th>Resets</th><th>Week</th><th>Resets</th><th>Sonnet wk</th><th>Opus wk</th></tr>
+<tr><th>Account</th><th>Email</th><th>5h</th><th>Resets</th><th>Week</th><th>Resets</th><th>Sonnet wk</th><th>Opus wk</th><th>Status</th></tr>
 {{range .Rows}}<tr>
 <td>{{.Account.Name}}</td><td class="muted">{{.Account.Email}}</td>
-{{if .Err}}<td colspan="6" class="err">{{.Err}}</td>{{else}}
+{{if .Usage}}
 <td>{{template "win" .Usage.FiveHour}}</td><td>{{resets .Usage.FiveHour}}</td>
 <td>{{template "win" .Usage.SevenDay}}</td><td>{{resets .Usage.SevenDay}}</td>
 <td>{{pct .Usage.SevenDaySonnet}}</td><td>{{pct .Usage.SevenDayOpus}}</td>
-{{end}}</tr>
+{{else}}<td colspan="6" class="muted">no data yet</td>{{end}}
+<td>{{if .Err}}<span class="err">{{if .Usage}}as of {{ago .FetchedAt}} ago: {{end}}{{.Err}}</span>{{else}}<span class="muted">live</span>{{end}}</td>
+</tr>
 {{end}}</table>
 </body>
 </html>
