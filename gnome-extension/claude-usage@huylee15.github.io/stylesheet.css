@@ -1,0 +1,9 @@
+.claude-usage-box { spacing: 10px; }
+.claude-usage-name { color: #dddddd; margin-right: 4px; }
+.claude-usage-ok { color: #3fb950; font-weight: bold; }
+.claude-usage-warn { color: #d29922; font-weight: bold; }
+.claude-usage-crit { color: #f85149; font-weight: bold; }
+.claude-usage-none { color: #888888; }
+.claude-usage-stale { color: #999999; font-style: italic; }
+.claude-usage-detail { font-family: monospace; }
+.claude-usage-error { color: #f85149; }

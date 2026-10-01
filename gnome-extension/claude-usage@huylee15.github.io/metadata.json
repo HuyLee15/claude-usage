@@ -1,0 +1,7 @@
+{
+  "uuid": "claude-usage@huylee15.github.io",
+  "name": "Claude Usage",
+  "description": "Shows the 5-hour and weekly usage of every Claude account configured in the claude-usage CLI.",
+  "shell-version": ["45", "46", "47", "48"],
+  "url": "https://github.com/HuyLee15/claude-usage"
+}

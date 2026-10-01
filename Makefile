@@ -24,3 +24,22 @@ fmt:
 
 clean:
 	rm -rf $(BIN_DIR)
+
+EXT_UUID := claude-usage@huylee15.github.io
+EXT_SRC  := gnome-extension/$(EXT_UUID)
+EXT_DIR  := $(HOME)/.local/share/gnome-shell/extensions/$(EXT_UUID)
+
+.PHONY: install-extension uninstall-extension
+
+## install-extension: install and enable the GNOME Shell panel indicator
+install-extension:
+	@mkdir -p $(EXT_DIR)
+	install -m 0644 $(EXT_SRC)/metadata.json $(EXT_SRC)/extension.js $(EXT_SRC)/stylesheet.css $(EXT_DIR)/
+	@sh gnome-extension/enable.sh $(EXT_UUID)
+	@echo "installed $(EXT_DIR)"
+	@echo "reload GNOME Shell once: X11 -> Alt+F2, r, Enter; Wayland -> log out and back in"
+
+## uninstall-extension: disable and remove the GNOME Shell panel indicator
+uninstall-extension:
+	-gnome-extensions disable $(EXT_UUID)
+	rm -rf $(EXT_DIR)

@@ -64,6 +64,23 @@ claude-usage serve --addr :9000 --interval 2m
 The page auto-refreshes, has a "refresh now" button (throttled to once per 10 s), and exposes the
 same data as JSON at `/api/usage`.
 
+## GNOME panel indicator (Ubuntu)
+
+A GNOME Shell extension (GNOME 45 to 48) puts every account on the top bar, e.g. `be1 76%·w100%  be2 22%  be3 100%`.
+The number is the 5-hour usage; `·wNN%` is appended when the weekly window is at 90 % or more, and the colour
+follows whichever of the two is fuller. Click it for the full breakdown, reset times, and a "Refresh now" item.
+
+```sh
+make install              # the extension calls this binary
+make install-extension    # copies the extension and enables it
+```
+
+Then reload GNOME Shell once so it picks the extension up: on X11 press `Alt+F2`, type `r`, Enter; on Wayland log
+out and back in. `make uninstall-extension` removes it again.
+
+The extension only runs `claude-usage --json` every 2 minutes and when the menu opens. Tokens, the cache and the
+rate-limit backoff all stay in the CLI, so the panel, the dashboard and a terminal can run at the same time.
+
 ## How it works
 
 1. `login` runs the standard OAuth authorization-code + PKCE flow against `claude.ai/oauth/authorize`
