@@ -79,7 +79,7 @@ func (d *dashboard) poll(ctx context.Context) {
 
 // refresh keeps the previous rows when a whole cycle fails, so a transient error does not blank the page.
 func (d *dashboard) refresh(ctx context.Context, force bool) {
-	results, err := d.cli.snapshot(ctx, force)
+	results, err := d.cli.snapshot(ctx, snapshotOptions{force: force})
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.updated, d.err = time.Now(), err

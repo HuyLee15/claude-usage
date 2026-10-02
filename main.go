@@ -20,7 +20,7 @@ var version = "dev"
 const usageText = `claude-usage — rate-limit usage of every Claude subscription account in one place
 
 Usage:
-  claude-usage [check] [--json] [--force]
+  claude-usage [check] [--json] [--force] [--account NAME]
                                          show 5h / weekly usage for all accounts
   claude-usage login [--no-browser] <name>
                                          add (or re-authorize) an account via browser login
@@ -35,9 +35,12 @@ Results are cached for CLAUDE_USAGE_CACHE_TTL; --force skips that window but nev
 Environment:
   CLAUDE_USAGE_CONFIG_DIR   where accounts.json and cache.json live (default: <user config dir>/claude-usage)
   CLAUDE_USAGE_CACHE_TTL    how long a fetched result is reused (default 60s)
-  CLAUDE_USAGE_USER_AGENT   User-Agent sent to Anthropic (default claude-code/<version>)
+  CLAUDE_USAGE_USER_AGENT   User-Agent for the usage endpoint (default claude-code/<version>)
+  CLAUDE_USAGE_OAUTH_USER_AGENT
+                            User-Agent for the token endpoint (default axios/<version>)
   CLAUDE_USAGE_API_BASE     usage endpoint host (default https://api.anthropic.com)
   CLAUDE_USAGE_OAUTH_BASE   token endpoint host (default https://platform.claude.com)
+  CLAUDE_USAGE_DEBUG        log every HTTP exchange (status, headers, error bodies) to stderr
   NO_COLOR                  disable ANSI colors
 `
 
@@ -92,10 +95,11 @@ func runCheck(ctx context.Context, cli *client, args []string) error {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "print machine-readable JSON instead of a table")
 	force := fs.Bool("force", false, "ignore the cache freshness window (rate-limit backoff still applies)")
+	only := fs.String("account", "", "query a single account by name")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	results, err := cli.snapshot(ctx, *force)
+	results, err := cli.snapshot(ctx, snapshotOptions{force: *force, only: *only})
 	if err != nil {
 		return err
 	}

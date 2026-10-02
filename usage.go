@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,8 +69,13 @@ type client struct {
 	apiBase    string
 	oauthBase  string
 	userAgent  string
+	oauthUA    string
 	configDir  string
 	cacheTTL   time.Duration
+	debug      bool
+	// refreshMu serializes token refreshes: the token endpoint is far stricter than the usage endpoint,
+	// and every account tends to expire in the same minute.
+	refreshMu sync.Mutex
 }
 
 func newClient(cfg settings) *client {
@@ -77,8 +84,10 @@ func newClient(cfg settings) *client {
 		apiBase:    cfg.apiBase,
 		oauthBase:  cfg.oauthBase,
 		userAgent:  cfg.userAgent,
+		oauthUA:    cfg.oauthUserAgent,
 		configDir:  cfg.configDir,
 		cacheTTL:   cfg.cacheTTL,
+		debug:      cfg.debug,
 	}
 }
 
@@ -90,9 +99,16 @@ func (c *client) cachePath() string {
 	return filepath.Join(c.configDir, cacheFileName)
 }
 
+// snapshotOptions tunes one fetch cycle: force skips the cache window (never the backoff) and only
+// restricts the cycle to a single account.
+type snapshotOptions struct {
+	force bool
+	only  string
+}
+
 // snapshot runs one fetch cycle under the config-dir lock and re-reads both files inside it,
 // so it always starts from tokens another process may have just rotated.
-func (c *client) snapshot(ctx context.Context, force bool) ([]result, error) {
+func (c *client) snapshot(ctx context.Context, opts snapshotOptions) ([]result, error) {
 	unlock, err := lockConfigDir(c.configDir)
 	if err != nil {
 		return nil, err
@@ -112,7 +128,13 @@ func (c *client) snapshot(ctx context.Context, force bool) ([]result, error) {
 		return nil, err
 	}
 	cache.retain(accounts)
-	results := c.fetchAll(ctx, st, cache, accounts, force)
+	if opts.only != "" {
+		accounts = slices.DeleteFunc(accounts, func(acc *account) bool { return acc.Name != opts.only })
+		if len(accounts) == 0 {
+			return nil, fmt.Errorf("%w: %s", errAccountNotFound, opts.only)
+		}
+	}
+	results := c.fetchAll(ctx, st, cache, accounts, opts.force)
 	if err := cache.save(); err != nil {
 		return nil, err
 	}
@@ -185,6 +207,8 @@ func (c *client) fetchOne(ctx context.Context, st *store, acc *account) (*usage,
 }
 
 func (c *client) refreshTokens(ctx context.Context, st *store, acc *account) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
 	tok, err := c.postToken(ctx, tokenRequest{
 		GrantType:    "refresh_token",
 		ClientID:     oauthClientID,
@@ -226,14 +250,18 @@ func (c *client) doJSON(ctx context.Context, method, endpoint, bearer string, bo
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", c.userAgent)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if bearer != "" {
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", c.userAgent)
 		req.Header.Set("Authorization", "Bearer "+bearer)
 		req.Header.Set("anthropic-beta", oauthBeta)
+	} else {
+		// Unauthenticated calls are the token endpoint; mirror the axios request shape Claude Code sends there.
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("User-Agent", c.oauthUA)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -243,6 +271,9 @@ func (c *client) doJSON(ctx context.Context, method, endpoint, bearer string, bo
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
+	}
+	if c.debug {
+		logExchange(req, resp, data)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return &httpError{
@@ -265,12 +296,26 @@ type httpError struct {
 
 func (e *httpError) Error() string {
 	switch {
+	case e.Status == http.StatusTooManyRequests && e.Body != "":
+		return "rate limited (HTTP 429): " + e.Body
 	case e.Status == http.StatusTooManyRequests:
 		return "rate limited (HTTP 429)"
 	case e.Body == "":
 		return fmt.Sprintf("HTTP %d", e.Status)
 	}
 	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body)
+}
+
+// logExchange prints one request/response pair to stderr. Request bodies and 2xx bodies carry tokens,
+// so only the status line, a few diagnostic headers and error bodies are shown.
+func logExchange(req *http.Request, resp *http.Response, body []byte) {
+	fmt.Fprintf(os.Stderr, "> %s %s  ua=%q\n", req.Method, req.URL, req.Header.Get("User-Agent"))
+	fmt.Fprintf(os.Stderr, "< %s  retry-after=%q  cf-ray=%q  content-type=%q  request-id=%q\n",
+		resp.Status, resp.Header.Get("Retry-After"), resp.Header.Get("Cf-Ray"),
+		resp.Header.Get("Content-Type"), resp.Header.Get("Request-Id"))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		fmt.Fprintf(os.Stderr, "< body: %s\n", preview(body))
+	}
 }
 
 func isStatus(err error, status int) bool {

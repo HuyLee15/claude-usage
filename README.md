@@ -46,6 +46,8 @@ here does not log Claude Code out, and Claude Code refreshing its token does not
 ```sh
 claude-usage             # table for all accounts (same as `claude-usage check`)
 claude-usage --json      # machine-readable, e.g. for a status bar or a script
+claude-usage --force     # skip the 60s cache (a rate-limit backoff is still honoured)
+claude-usage --account be1
 claude-usage list        # stored accounts and token state
 claude-usage remove side # forget an account
 ```
@@ -90,7 +92,9 @@ rate-limit backoff all stay in the CLI, so the panel, the dashboard and a termin
 3. On every check the tool refreshes any token that is about to expire (or that the API rejects with
    401) using the refresh token, persists the rotated pair immediately, then calls
    `GET https://api.anthropic.com/api/oauth/usage` with `Authorization: Bearer …`,
-   `anthropic-beta: oauth-2025-04-20` and a Claude Code `User-Agent`. Accounts are queried in parallel.
+   `anthropic-beta: oauth-2025-04-20` and a Claude Code `User-Agent`. Usage calls run in parallel;
+   token refreshes run one at a time and carry the `axios/<version>` User-Agent, which is what Claude
+   Code's own OAuth calls send (see Limitations for why each endpoint gets a different one).
 4. Results are cached in `cache.json` for `CLAUDE_USAGE_CACHE_TTL` (60 s). A failed fetch keeps showing the last
    good numbers marked "as of … ago" and backs off 1, 2, 4, 8, then 15 minutes before that account is tried
    again. `--force` skips the cache window but never the backoff.
@@ -105,7 +109,9 @@ rate-limit backoff all stay in the CLI, so the panel, the dashboard and a termin
 |---------------------------|----------------------------------|------------------------------------------|
 | `CLAUDE_USAGE_CONFIG_DIR` | `<user config dir>/claude-usage` | where `accounts.json` and `cache.json` live |
 | `CLAUDE_USAGE_CACHE_TTL`  | `60s`                            | how long a fetched result is reused      |
-| `CLAUDE_USAGE_USER_AGENT` | `claude-code/2.1.285`            | User-Agent sent to Anthropic             |
+| `CLAUDE_USAGE_USER_AGENT` | `claude-code/2.1.285`            | User-Agent for the usage endpoint        |
+| `CLAUDE_USAGE_OAUTH_USER_AGENT` | `axios/1.15.2`             | User-Agent for the token endpoint        |
+| `CLAUDE_USAGE_DEBUG`      | unset                            | log every HTTP exchange to stderr (no tokens) |
 | `CLAUDE_USAGE_API_BASE`   | `https://api.anthropic.com`      | host of the usage endpoint               |
 | `CLAUDE_USAGE_OAUTH_BASE` | `https://platform.claude.com`    | host of the token endpoint               |
 | `NO_COLOR`                | unset                            | disable ANSI colors in the table         |
@@ -114,6 +120,10 @@ rate-limit backoff all stay in the CLI, so the panel, the dashboard and a termin
 
 - `/api/oauth/usage` is not a documented API; Anthropic may change its shape without notice.
 - Organizations that disable OAuth for Claude Code return HTTP 403 for that account.
-- The endpoint rate-limits by `User-Agent`: any value other than Claude Code's gets HTTP 429 almost every time
-  ([anthropics/claude-code#30930](https://github.com/anthropics/claude-code/issues/30930)). Even with the right
-  value it throttles if polled too often, which is what the cache and backoff are for.
+- Both endpoints rate-limit by `User-Agent`, in opposite directions. `/api/oauth/usage` returns HTTP 429 for any
+  value other than Claude Code's own (`claude-code/<version>`,
+  [anthropics/claude-code#30930](https://github.com/anthropics/claude-code/issues/30930)). The token endpoint
+  returns the same `rate_limit_error` 429 **for** `claude-code/<version>`, because the real client reaches it
+  through axios, and accepts `axios/<version>`. Even with the right values the usage endpoint throttles if polled
+  too often, which is what the cache and backoff are for. `CLAUDE_USAGE_DEBUG=1` shows each exchange when
+  something changes again.
