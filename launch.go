@@ -77,6 +77,16 @@ func runClaude(ctx context.Context, cli *client, args []string) error {
 			return fmt.Errorf("create Claude session id: %w", err)
 		}
 		claudeArgs = append(claudeArgs, "--session-id", sessionID)
+	} else if resumeExisting {
+		owner, err := accountWithSession(root, results, sessionID)
+		if err != nil {
+			return err
+		}
+		selected = owner
+		profile, err = accountProfile(root, selected.Account.Name)
+		if err != nil {
+			return err
+		}
 	}
 
 	tried := map[string]bool{selected.Account.Name: true}
