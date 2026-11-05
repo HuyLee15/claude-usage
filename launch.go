@@ -17,6 +17,7 @@ func runClaude(ctx context.Context, cli *client, args []string) error {
 	min5h := fs.Float64("min-5h", 0, "minimum remaining 5-hour quota percentage")
 	minWeek := fs.Float64("min-week", 0, "minimum remaining weekly quota percentage")
 	profileRoot := fs.String("profiles", "", "root directory for per-account Claude profiles")
+	force := fs.Bool("force", false, "refresh usage before selecting an account")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -27,7 +28,7 @@ func runClaude(ctx context.Context, cli *client, args []string) error {
 		return errors.New("Claude Code executable cannot be empty")
 	}
 
-	results, err := cli.snapshot(ctx, snapshotOptions{})
+	results, err := cli.snapshot(ctx, snapshotOptions{force: *force})
 	if err != nil {
 		return err
 	}
