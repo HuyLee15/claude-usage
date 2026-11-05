@@ -111,6 +111,51 @@ func isUsageLimitOutput(output string) bool {
 
 // migrateSessionTranscript copies only the selected session's JSONL transcript. It never copies
 // credentials, settings, or other account-profile data.
+func accountWithSession(root string, results []result, sessionID string) (result, error) {
+	var owner result
+	found := false
+	for _, candidate := range results {
+		if candidate.Account == nil {
+			continue
+		}
+		profile, err := accountProfile(root, candidate.Account.Name)
+		if err != nil {
+			return result{}, err
+		}
+		if hasSessionTranscript(profile, sessionID) {
+			if found {
+				return result{}, fmt.Errorf("session %s exists in more than one account profile; refusing ambiguous resume", sessionID)
+			}
+			owner, found = candidate, true
+		}
+	}
+	if !found {
+		return result{}, fmt.Errorf("session %s was not found in any configured Claude account profile", sessionID)
+	}
+	return owner, nil
+}
+
+func hasSessionTranscript(profile, sessionID string) bool {
+	found := false
+	_ = filepath.WalkDir(filepath.Join(profile, "projects"), func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return filepath.SkipAll
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !entry.IsDir() && entry.Name() == sessionID+".jsonl" {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
 func migrateSessionTranscript(sourceProfile, targetProfile, sessionID string) error {
 	if sessionID == "" || strings.ContainsAny(sessionID, `/\\`) {
 		return errors.New("invalid session id")
