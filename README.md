@@ -56,6 +56,30 @@ Columns: `5H` and `WEEK` show utilization with a bar (green < 70 %, yellow < 90 
 the time until the window resets. `SONNET` / `OPUS` are the per-model weekly windows; `—` means the
 plan does not track that window.
 
+## Launch Claude Code with the account that has the most quota
+
+Authenticate each account separately in Claude Code once. The launcher keeps Claude Code's
+configuration directories isolated by account and never copies or edits OAuth tokens:
+
+```sh
+claude-usage run
+claude-usage run --min-5h 20 --min-week 10
+claude-usage run --claude /path/to/claude -- --resume
+```
+
+The launcher queries fresh usage, skips accounts with failed or incomplete usage data, and selects
+the eligible account with the lowest maximum utilization across the 5-hour and weekly windows.
+It starts Claude Code with `CLAUDE_CONFIG_DIR` set to
+`$CLAUDE_USAGE_PROFILE_DIR/<account-name>` (default:
+`<user config dir>/claude-usage/profiles/<account-name>`). Each profile must be signed in once
+using Claude Code itself. The optional minimums are remaining quota percentages.
+
+This command selects an account **before starting** Claude Code. It does not yet detect an
+in-session usage-limit error and transparently migrate a live conversation to another account.
+Claude Code session transcripts are stored with the profile, so cross-profile resume is not
+guaranteed; the launcher deliberately does not copy private session files or modify Claude Code's
+OAuth state to simulate a successful resume.
+
 ## Web dashboard
 
 ```sh
