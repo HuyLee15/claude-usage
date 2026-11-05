@@ -56,6 +56,38 @@ Columns: `5H` and `WEEK` show utilization with a bar (green < 70 %, yellow < 90 
 the time until the window resets. `SONNET` / `OPUS` are the per-model weekly windows; `—` means the
 plan does not track that window.
 
+## Launch Claude Code with the account that has the most quota
+
+Authenticate each account separately in Claude Code once. The launcher keeps Claude Code's
+configuration directories isolated by account and never copies or edits OAuth tokens:
+
+```sh
+claude-usage run
+claude-usage run --min-5h 20 --min-week 10
+claude-usage run --auto-resume --max-switches 3 -- -p "Continue implementing the feature"
+claude-usage run --claude /path/to/claude -- --resume <session-id>
+```
+
+The launcher queries fresh usage, skips accounts with failed or incomplete usage data, and selects
+the eligible account with the lowest maximum utilization across the 5-hour and weekly windows.
+It starts Claude Code with `CLAUDE_CONFIG_DIR` set to
+`$CLAUDE_USAGE_PROFILE_DIR/<account-name>` (default:
+`<user config dir>/claude-usage/profiles/<account-name>`). Each profile must be signed in once
+using Claude Code itself. The optional minimums are remaining quota percentages.
+
+For Claude Code **print mode** (`-p` / `--print`), Auto Resume is enabled by default. When
+Claude Code exits with a recognized usage-limit message, the launcher refreshes account usage,
+selects the best account not already tried, copies only that session's JSONL transcript into the
+next account profile, and retries with `--resume <session-id>`. It never copies OAuth credentials
+or other profile files. Use `--max-switches 0` to disable switching, or set a smaller limit to
+control how many account changes are attempted.
+
+Interactive TUI sessions are launched normally without automatic migration. Capturing an
+interactive process would detach its terminal (TTY) and break the UI; the launcher therefore
+does not pretend to resume an interactive session. Auto Resume is best-effort and only triggers
+for explicit usage-limit markers, not network failures or arbitrary non-zero exits. A session
+started with `--resume <session-id>` is routed to the profile that already owns its transcript.
+
 ## Web dashboard
 
 ```sh

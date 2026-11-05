@@ -28,6 +28,10 @@ Usage:
   claude-usage remove <name>             forget an account
   claude-usage serve [--addr 127.0.0.1:8787] [--interval 60s]
                                          local web dashboard
+  claude-usage run [--min-5h 20] [--min-week 10] [--auto-resume] [--max-switches 3]
+                   [--claude claude] [--] [args...]
+                                         choose an account with quota and launch Claude Code
+                                         auto-resume usage-limit exits in Claude Code print mode (-p)
   claude-usage version
 
 Results are cached for CLAUDE_USAGE_CACHE_TTL; --force skips that window but never a rate-limit backoff.
@@ -76,6 +80,8 @@ func run(args []string) error {
 		return runRemove(cli, args)
 	case "serve":
 		return runServe(ctx, cli, args)
+	case "run":
+		return runClaude(ctx, cli, args)
 	case "version":
 		fmt.Println("claude-usage", version)
 		return nil
