@@ -60,7 +60,7 @@ func runClaude(ctx context.Context, cli *client, args []string) error {
 		selected.Account.Name, selected.Account.Email, profile)
 	cmd := exec.CommandContext(ctx, *command, fs.Args()...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+profile)
+	cmd.Env = claudeProfileEnv(os.Environ(), profile)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("Claude Code: %w", err)
 	}
@@ -95,4 +95,15 @@ func selectAccount(results []result, min5h, minWeek float64) (result, error) {
 		return result{}, errors.New("no account has fresh usage data and enough quota; check account status first")
 	}
 	return best, nil
+}
+
+func claudeProfileEnv(env []string, profile string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "CLAUDE_CONFIG_DIR=") {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return append(out, "CLAUDE_CONFIG_DIR="+profile)
 }
