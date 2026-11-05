@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -34,14 +33,22 @@ func sessionIDFromArgs(args []string) (string, bool, error) {
 			}
 			return args[i+1], true, nil
 		case strings.HasPrefix(arg, "--resume="):
-			return strings.TrimPrefix(arg, "--resume="), true, nil
+			id := strings.TrimPrefix(arg, "--resume=")
+			if id == "" {
+				return "", true, errors.New("--resume requires a session id")
+			}
+			return id, true, nil
 		case arg == "--session-id":
 			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
 				return "", false, errors.New("--session-id requires a value")
 			}
 			return args[i+1], false, nil
 		case strings.HasPrefix(arg, "--session-id="):
-			return strings.TrimPrefix(arg, "--session-id="), false, nil
+			id := strings.TrimPrefix(arg, "--session-id=")
+			if id == "" {
+				return "", false, errors.New("--session-id requires a value")
+			}
+			return id, false, nil
 		}
 	}
 	return "", false, nil
@@ -83,7 +90,8 @@ func withResumeSession(args []string, sessionID string) []string {
 
 func launchClaudeCapture(ctx context.Context, executable string, args []string, profile string) (string, error) {
 	cmd := exec.CommandContext(ctx, executable, args...)
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr tailBuffer
+	stdout.limit, stderr.limit = 1<<20, 1<<20
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = io.MultiWriter(os.Stdout, &stdout)
 	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
@@ -109,8 +117,32 @@ func isUsageLimitOutput(output string) bool {
 	return false
 }
 
-// migrateSessionTranscript copies only the selected session's JSONL transcript. It never copies
-// credentials, settings, or other account-profile data.
+// tailBuffer retains only the last limit bytes, keeping error detection bounded for long print runs.
+type tailBuffer struct {
+	data  []byte
+	limit int
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if b.limit <= 0 {
+		return n, nil
+	}
+	if len(p) >= b.limit {
+		b.data = append(b.data[:0], p[len(p)-b.limit:]...)
+		return n, nil
+	}
+	if overflow := len(b.data) + len(p) - b.limit; overflow > 0 {
+		copy(b.data, b.data[overflow:])
+		b.data = b.data[:len(b.data)-overflow]
+	}
+	b.data = append(b.data, p...)
+	return n, nil
+}
+
+func (b *tailBuffer) String() string { return string(b.data) }
+
+// accountWithSession locates an existing session in exactly one configured profile.
 func accountWithSession(root string, results []result, sessionID string) (result, error) {
 	var owner result
 	found := false
@@ -156,6 +188,8 @@ func hasSessionTranscript(profile, sessionID string) bool {
 	return found
 }
 
+// migrateSessionTranscript copies only the selected session's JSONL transcript. It never copies
+// credentials, settings, or other account-profile data.
 func migrateSessionTranscript(sourceProfile, targetProfile, sessionID string) error {
 	if sessionID == "" || strings.ContainsAny(sessionID, `/\\`) {
 		return errors.New("invalid session id")
