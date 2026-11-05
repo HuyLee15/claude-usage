@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 )
 
@@ -76,8 +75,9 @@ func TestMigrateSessionTranscriptCopiesOnlyMatchingSession(t *testing.T) {
 	if string(got) != transcript {
 		t.Fatalf("got %q, want %q", got, transcript)
 	}
-	if strings.Contains(targetFile, "source") {
-		t.Fatal("target unexpectedly points into source profile")
+	rel, err := filepath.Rel(target, targetFile)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		t.Fatalf("target file escaped destination profile: %q (%v)", rel, err)
 	}
 }
 
